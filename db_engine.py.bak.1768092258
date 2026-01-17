@@ -1,0 +1,95 @@
+
+import asyncpg
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "10.0.1.1"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "database": os.getenv("DB_NAME", "agent_memory"),
+    "user": os.getenv("DB_USER", "agent_user"),
+    "password": os.getenv("DB_PASSWORD"),
+}
+
+class DBManager:
+    def __init__(self):
+        self.pool = None
+
+    async def init_pool(self):
+        self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=5, max_size=20)
+
+    async def execute_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.execute(query, *args)
+
+    async def fetch_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetch(query, *args)
+
+    async def fetchval_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetchval(query, *args)
+
+    async def create_session(self, task_description, metadata=None):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO agent_sessions (task_description, metadata) VALUES ($1,$2) RETURNING id",
+                task_description,
+                metadata,
+            )
+
+    async def log_phase(self, session_id, phase_name, model, input_ctx, output, tokens, duration, success, error=None):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO agent_phases
+                (session_id, phase_name, model_used, input_context, output_content,
+                 tokens_used, duration_ms, success, error_message)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            """, session_id, phase_name, model, input_ctx, output, tokens, duration, success, error)
+
+    async def log_commit(self, session_id, repo, branch, commit_hash, message, files, lines_add, lines_rem):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO git_commits
+                (session_id, repo_name, branch_name, commit_hash,
+                 commit_message, files_changed, lines_added, lines_removed)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            """, session_id, repo, branch, commit_hash, message, files, lines_add, lines_rem)
+
+    async def execute_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.execute(query, *args)
+
+    async def fetch_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetch(query, *args)
+
+    async def fetchval_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetchval(query, *args)
+

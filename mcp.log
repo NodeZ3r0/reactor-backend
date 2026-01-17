@@ -1,0 +1,34 @@
+nohup: ignoring input
+[AUTH] Loaded config: URL=https://auth.wopr.systems, REALM=ai
+/home/nodez3r0/ai-coding-agent/mcp-server/server.py:926: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+/home/nodez3r0/ai-coding-agent/mcp-server/server.py:940: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+INFO:     Started server process [186740]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8890 (Press CTRL+C to quit)
+Starting MCP Server on 0.0.0.0:8890
+============================================================
+✓ MCP Server started successfully
+✓ Database: 10.0.1.1:5432/agent_memory
+✓ Repos: /home/nodez3r0/ai-coding-agent/repos
+✓ Allowed repos: []
+✓ GitHub org: personal account
+✓ Multi-user auth: Enabled (Keycloak JWT + API Key)
+============================================================
+INFO:     10.0.0.2:32768 - "HEAD / HTTP/1.1" 404 Not Found
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [186740]

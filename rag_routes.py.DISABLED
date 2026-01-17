@@ -1,0 +1,24 @@
+
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from auth_middleware import verify_api_key
+from rag_engine import ingest_file, list_documents, search_docs
+
+router = APIRouter(prefix="/api/rag", tags=["rag"])
+
+@router.get("/health")
+async def health():
+    return {"status": "ok", "rag": "online"}
+
+@router.get("/docs")
+async def docs(_=Depends(verify_api_key)):
+    return list_documents()
+
+@router.post("/upload")
+async def upload(file: UploadFile = File(...), _=Depends(verify_api_key)):
+    content = await file.read()
+    result = await ingest_file(file.filename, content)
+    return {"status": "ok", "doc": file.filename, "chunks": result}
+
+@router.post("/search")
+async def search(q: str, _=Depends(verify_api_key)):
+    return search_docs(q)

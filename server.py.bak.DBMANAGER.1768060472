@@ -1,0 +1,993 @@
+#!/usr/bin/env python3
+"""
+MCP Server - Model Context Protocol Server for vault.wopr.systems
+Complete production-ready implementation with multi-user authentication
+"""
+
+from fastapi import FastAPI, Request, Response, HTTPException, Security, Depends
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+import asyncpg
+import subprocess
+import os
+import git
+from datetime import datetime
+import json
+import httpx
+from dotenv import load_dotenv
+from auth_middleware import extract_user_from_token, User
+
+load_dotenv()
+
+app = FastAPI(
+    title="MCP Agent Server - vault.wopr.systems",
+    description="Model Context Protocol Server for AI Coding Agent",
+    version="1.0.0"
+)
+
+from ui_status_routes import router as ui_status_router
+from ide_routes import router as ide_router
+from server_additions import router as additions_router
+app.include_router(ui_status_router)
+app.include_router(ide_router)
+
+# Configuration
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+VALID_API_KEY = os.getenv("MCP_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_ORG = os.getenv("GITHUB_ORG")
+GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com")
+
+# Multi-user authentication
+security = HTTPBearer(auto_error=False)
+
+# Database configuration (Hetzner WOPR via Nebula)
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "10.0.1.1"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "database": os.getenv("DB_NAME", "agent_memory"),
+    "user": os.getenv("DB_USER", "agent_user"),
+    "password": os.getenv("DB_PASSWORD")
+}
+
+# Paths
+REPOS_BASE_PATH = os.getenv("REPOS_BASE_PATH", "/opt")
+ALLOWED_REPOS = [r.strip() for r in os.getenv("ALLOWED_REPOS", "").split(",") if r.strip()]
+
+os.makedirs(REPOS_BASE_PATH, exist_ok=True)
+
+
+class DBManager:
+    """Database connection pool manager"""
+    def __init__(self):
+        self.pool = None
+
+    async def init_pool(self):
+        """Initialize connection pool"""
+        self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=5, max_size=20)
+
+    async def execute_with_user_context(self, user: User, query: str, *args):
+        """Execute query with RLS user context"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.execute(query, *args)
+
+    async def fetch_with_user_context(self, user: User, query: str, *args):
+        """Fetch query results with RLS user context"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetch(query, *args)
+
+    async def fetchval_with_user_context(self, user: User, query: str, *args):
+        """Fetch single value with RLS user context"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetchval(query, *args)
+
+    async def log_phase(self, session_id, phase_name, model, input_ctx, output, tokens, duration, success, error=None):
+        """Log a phase execution to database"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO agent_phases
+                (session_id, phase_name, model_used, input_context, output_content,
+                 tokens_used, duration_ms, success, error_message)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, session_id, phase_name, model, input_ctx, output, tokens, duration, success, error)
+
+    async def log_commit(self, session_id, repo, branch, commit_hash, message, files, lines_add, lines_rem):
+        """Log a git commit to database"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO git_commits
+                (session_id, repo_name, branch_name, commit_hash, commit_message,
+                 files_changed, lines_added, lines_removed)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """, session_id, repo, branch, commit_hash, message, files, lines_add, lines_rem)
+
+    async def create_session(self, task_description, metadata=None):
+        """Create a new agent session"""
+        async with self.pool.acquire() as conn:
+            session_id = await conn.fetchval("""
+                INSERT INTO agent_sessions (task_description, metadata)
+                VALUES ($1, $2)
+                RETURNING session_id
+            """, task_description, json.dumps(metadata) if metadata else None)
+            return str(session_id)
+
+    async def update_session_status(self, session_id, status, completed_at=None):
+        """Update session status"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE agent_sessions
+                SET status = $1, completed_at = $2
+                WHERE session_id = $3
+            """, status, completed_at or datetime.now(), session_id)
+
+
+db = DBManager()
+
+
+# Pydantic Models
+class GitCloneRequest(BaseModel):
+    repo_url: str
+    branch: Optional[str] = "main"
+
+
+class FileReadRequest(BaseModel):
+    repo_name: str
+    file_path: str
+
+
+class FileWriteRequest(BaseModel):
+    repo_name: str
+    file_path: str
+    content: str
+
+
+class GitCommitRequest(BaseModel):
+    repo_name: str
+    branch: str
+    files: List[str]
+    message: str
+    session_id: str
+
+
+class BuildRequest(BaseModel):
+    repo_name: str
+    build_command: str
+    session_id: str
+
+
+class GitHubForkRequest(BaseModel):
+    source_repo: str
+
+
+class MCPContextRequest(BaseModel):
+    conversation_id: str
+    context_type: str
+    context_data: dict
+    project_id: Optional[str] = None
+
+
+# Authentication dependencies
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[User]:
+    """Extract user from JWT token"""
+    if not credentials:
+        return None
+    token = credentials.credentials
+    user = extract_user_from_token(token)
+    return user
+
+
+async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+    """Verify API key (legacy authentication)"""
+    if api_key != VALID_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    return api_key
+
+
+async def verify_auth(
+    api_key: Optional[str] = Security(API_KEY_HEADER),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> User:
+    """Verify either API key or JWT - backward compatible"""
+    # Try API key first
+    if api_key == VALID_API_KEY:
+        return User('system', 'system', 'system@wopr.systems', is_admin=True)
+
+    # Try JWT
+    if credentials:
+        user = extract_user_from_token(credentials.credentials)
+        if user:
+            return user
+
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+# Health check
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "database": "connected" if db.pool else "disconnected",
+        "postgres_host": DB_CONFIG["host"]
+    }
+
+
+# NEW: Multi-user MCP context endpoints
+@app.post("/api/mcp/context")
+async def save_mcp_context(request: MCPContextRequest, user: User = Depends(verify_auth)):
+    """Save MCP context for current user"""
+    try:
+        record_id = await db.fetchval_with_user_context(
+            user,
+            """
+            INSERT INTO mcp_context_history
+            (user_id, conversation_id, project_id, context_type, context_data)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            """,
+            user.id,
+            request.conversation_id,
+            request.project_id,
+            request.context_type,
+            json.dumps(request.context_data)
+        )
+
+        return {
+            "success": True,
+            "id": record_id,
+            "user": user.username
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save context: {str(e)}")
+
+
+@app.get("/api/mcp/context")
+async def get_mcp_context(
+    conversation_id: Optional[str] = None,
+    limit: int = 100,
+    user: User = Depends(verify_auth)
+):
+    """Get MCP context for current user"""
+    try:
+        results = await db.fetch_with_user_context(
+            user,
+            """
+            SELECT id, user_id, conversation_id, project_id, context_type,
+                   context_data, created_at
+            FROM mcp_context_history
+            WHERE ($1::text IS NULL OR conversation_id = $1)
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            conversation_id,
+            limit
+        )
+
+        return {
+            "success": True,
+            "data": [dict(r) for r in results],
+            "count": len(results)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch context: {str(e)}")
+
+
+@app.get("/api/me")
+async def get_current_user_info(user: User = Depends(verify_auth)):
+    """Get current user info"""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_admin": user.is_admin
+    }
+
+
+@app.get("/api/admin/dashboard")
+async def admin_dashboard(limit: int = 200, user: User = Depends(verify_auth)):
+    """Admin dashboard - see all users' context (requires admin role)"""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        results = await db.fetch_with_user_context(
+            user,
+            """
+            SELECT id, user_id, conversation_id, project_id, context_type,
+                   context_data, created_at
+            FROM mcp_context_history
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit
+        )
+
+        return {
+            "success": True,
+            "data": [dict(r) for r in results],
+            "count": len(results),
+            "admin": user.username
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard: {str(e)}")
+
+
+# Git Operations
+@app.post("/git/clone")
+async def git_clone(request: GitCloneRequest, api_key: str = Security(verify_api_key)):
+    """Clone a git repository"""
+    try:
+        repo_name = request.repo_url.split("/")[-1].replace(".git", "")
+        target_path = os.path.join(REPOS_BASE_PATH, repo_name)
+
+        if os.path.exists(target_path):
+            repo = git.Repo(target_path)
+            origin = repo.remote('origin')
+            origin.pull(request.branch)
+            return {"status": "updated", "path": target_path, "message": "Repository updated"}
+
+        git.Repo.clone_from(request.repo_url, target_path, branch=request.branch)
+
+        return {
+            "status": "success",
+            "path": target_path,
+            "repo": repo_name,
+            "branch": request.branch
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
+
+
+@app.post("/git/read")
+async def git_read_file(request: FileReadRequest, api_key: str = Security(verify_api_key)):
+    """Read a file from a git repository"""
+    try:
+        if request.repo_name not in ALLOWED_REPOS:
+            raise HTTPException(status_code=403, detail="Repository not allowed")
+
+        file_path = os.path.join(REPOS_BASE_PATH, request.repo_name, request.file_path)
+
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        if not os.path.abspath(file_path).startswith(os.path.abspath(REPOS_BASE_PATH)):
+            raise HTTPException(status_code=403, detail="Path traversal detected")
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        return {
+            "status": "success",
+            "file_path": request.file_path,
+            "content": content,
+            "size_bytes": len(content)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Read failed: {str(e)}")
+
+
+@app.post("/git/write")
+async def git_write_file(request: FileWriteRequest, api_key: str = Security(verify_api_key)):
+    """Write content to a file in repository"""
+    try:
+        if request.repo_name not in ALLOWED_REPOS:
+            raise HTTPException(status_code=403, detail="Repository not allowed")
+
+        file_path = os.path.join(REPOS_BASE_PATH, request.repo_name, request.file_path)
+
+        if not os.path.abspath(file_path).startswith(os.path.abspath(REPOS_BASE_PATH)):
+            raise HTTPException(status_code=403, detail="Path traversal detected")
+
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        backup_content = None
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                backup_content = f.read()
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(request.content)
+
+        return {
+            "status": "success",
+            "file_path": request.file_path,
+            "had_backup": backup_content is not None,
+            "size_bytes": len(request.content)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
+
+
+@app.post("/git/commit")
+async def git_commit(request: GitCommitRequest, api_key: str = Security(verify_api_key)):
+    """Create a git commit"""
+    try:
+        if request.repo_name not in ALLOWED_REPOS:
+            raise HTTPException(status_code=403, detail="Repository not allowed")
+
+        repo_path = os.path.join(REPOS_BASE_PATH, request.repo_name)
+        repo = git.Repo(repo_path)
+
+        try:
+            repo.git.checkout(request.branch)
+        except:
+            repo.git.checkout('-b', request.branch)
+
+        repo.index.add(request.files)
+        commit = repo.index.commit(request.message)
+        stats = commit.stats.total
+
+        await db.log_commit(
+            request.session_id,
+            request.repo_name,
+            request.branch,
+            commit.hexsha,
+            request.message,
+            len(request.files),
+            stats['insertions'],
+            stats['deletions']
+        )
+
+        return {
+            "status": "success",
+            "commit_hash": commit.hexsha,
+            "files_changed": len(request.files),
+            "lines_added": stats['insertions'],
+            "lines_removed": stats['deletions']
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Commit failed: {str(e)}")
+
+
+@app.post("/git/push")
+async def git_push(repo_name: str, branch: str, api_key: str = Security(verify_api_key)):
+    """Push commits to remote"""
+    try:
+        repo_path = os.path.join(REPOS_BASE_PATH, repo_name)
+        repo = git.Repo(repo_path)
+
+        if GITHUB_TOKEN:
+            with repo.config_writer() as git_config:
+                git_config.set_value('credential', 'helper', 'store')
+
+        origin = repo.remote('origin')
+        push_info = origin.push(branch)
+
+        return {
+            "status": "success",
+            "branch": branch,
+            "pushed": True
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Push failed: {str(e)}")
+
+
+# GitHub Operations
+@app.post("/github/fork")
+async def github_fork_repo(request: GitHubForkRequest, api_key: str = Security(verify_api_key)):
+    """Fork a GitHub repository to your org"""
+    try:
+        if "/" not in request.source_repo:
+            raise HTTPException(status_code=400, detail="Repository must be in format 'owner/repo'")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{GITHUB_API}/repos/{request.source_repo}/forks",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json={"organization": GITHUB_ORG} if GITHUB_ORG else {}
+            )
+
+            if response.status_code not in [200, 202]:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"GitHub API error: {response.text}"
+                )
+
+            fork_data = response.json()
+            repo_name = fork_data["name"]
+            clone_url = fork_data["clone_url"]
+            target_path = os.path.join(REPOS_BASE_PATH, repo_name)
+
+            if not os.path.exists(target_path):
+                git.Repo.clone_from(clone_url, target_path)
+
+            return {
+                "status": "success",
+                "fork_url": fork_data["html_url"],
+                "clone_url": fork_data["clone_url"],
+                "local_path": target_path,
+                "repo_name": repo_name
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fork failed: {str(e)}")
+
+
+@app.get("/github/search")
+async def github_search_repos(query: str, api_key: str = Security(verify_api_key)):
+    """Search GitHub for repositories"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{GITHUB_API}/search/repositories",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                params={
+                    "q": query,
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": 20
+                }
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"GitHub API error: {response.text}"
+                )
+
+            results = response.json()
+
+            repos = []
+            for item in results.get("items", []):
+                repos.append({
+                    "full_name": item["full_name"],
+                    "description": item["description"],
+                    "stars": item["stargazers_count"],
+                    "language": item["language"],
+                    "url": item["html_url"],
+                    "clone_url": item["clone_url"]
+                })
+
+            return {
+                "status": "success",
+                "total_count": results.get("total_count", 0),
+                "repos": repos
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@app.get("/github/list-my-repos")
+async def github_list_my_repos(api_key: str = Security(verify_api_key)):
+    """List all repos in your GitHub org/account"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if GITHUB_ORG:
+                response = await client.get(
+                    f"{GITHUB_API}/orgs/{GITHUB_ORG}/repos",
+                    headers={
+                        "Authorization": f"token {GITHUB_TOKEN}",
+                        "Accept": "application/vnd.github.v3+json"
+                    },
+                    params={"per_page": 100}
+                )
+            else:
+                response = await client.get(
+                    f"{GITHUB_API}/user/repos",
+                    headers={
+                        "Authorization": f"token {GITHUB_TOKEN}",
+                        "Accept": "application/vnd.github.v3+json"
+                    },
+                    params={"per_page": 100}
+                )
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"GitHub API error: {response.text}"
+                )
+
+            repos = response.json()
+
+            repo_list = []
+            for repo in repos:
+                repo_list.append({
+                    "name": repo["name"],
+                    "full_name": repo["full_name"],
+                    "description": repo["description"],
+                    "private": repo["private"],
+                    "fork": repo["fork"],
+                    "url": repo["html_url"],
+                    "clone_url": repo["clone_url"]
+                })
+
+            return {
+                "status": "success",
+                "org": GITHUB_ORG or "personal",
+                "count": len(repo_list),
+                "repos": repo_list
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"List repos failed: {str(e)}")
+
+
+@app.post("/github/create-pr")
+async def github_create_pr(
+    repo_name: str,
+    title: str,
+    body: str,
+    head_branch: str,
+    base_branch: str = "main",
+    api_key: str = Security(verify_api_key)
+):
+    """Create a pull request on GitHub"""
+    try:
+        full_repo = f"{GITHUB_ORG}/{repo_name}" if GITHUB_ORG else repo_name
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{GITHUB_API}/repos/{full_repo}/pulls",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json={
+                    "title": title,
+                    "body": body,
+                    "head": head_branch,
+                    "base": base_branch
+                }
+            )
+
+            if response.status_code != 201:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"GitHub API error: {response.text}"
+                )
+
+            pr_data = response.json()
+
+            return {
+                "status": "success",
+                "pr_number": pr_data["number"],
+                "pr_url": pr_data["html_url"],
+                "state": pr_data["state"]
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PR creation failed: {str(e)}")
+
+
+# Build Operations
+@app.post("/build/execute")
+async def build_execute(request: BuildRequest, api_key: str = Security(verify_api_key)):
+    """Execute a build command"""
+    try:
+        if request.repo_name not in ALLOWED_REPOS:
+            raise HTTPException(status_code=403, detail="Repository not allowed")
+
+        repo_path = os.path.join(REPOS_BASE_PATH, request.repo_name)
+
+        result = subprocess.run(
+            request.build_command,
+            shell=True,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        success = result.returncode == 0
+
+        async with db.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO build_results (session_id, build_status, build_output)
+                VALUES ($1, $2, $3)
+            """, request.session_id, "success" if success else "failed", result.stdout + result.stderr)
+
+        return {
+            "status": "success" if success else "failed",
+            "return_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Build timeout")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Build failed: {str(e)}")
+
+
+# Context Operations
+@app.get("/context/session/{session_id}")
+async def get_session_context(session_id: str, api_key: str = Security(verify_api_key)):
+    """Retrieve session context from database"""
+    try:
+        async with db.pool.acquire() as conn:
+            session = await conn.fetchrow(
+                "SELECT * FROM agent_sessions WHERE session_id = $1",
+                session_id
+            )
+
+            phases = await conn.fetch(
+                "SELECT * FROM agent_phases WHERE session_id = $1 ORDER BY created_at",
+                session_id
+            )
+
+            commits = await conn.fetch(
+                "SELECT * FROM git_commits WHERE session_id = $1",
+                session_id
+            )
+
+            return {
+                "session": dict(session) if session else None,
+                "phases": [dict(p) for p in phases],
+                "commits": [dict(c) for c in commits]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Context retrieval failed: {str(e)}")
+
+
+@app.get("/context/search")
+async def search_context(
+    query: str,
+    limit: int = 10,
+    api_key: str = Security(verify_api_key)
+):
+    """Search past sessions by keyword in task descriptions and outputs"""
+    try:
+        async with db.pool.acquire() as conn:
+            sessions = await conn.fetch("""
+                SELECT DISTINCT s.session_id, s.task_description, s.status,
+                       s.created_at, s.completed_at
+                FROM agent_sessions s
+                WHERE s.task_description ILIKE $1
+                ORDER BY s.created_at DESC
+                LIMIT $2
+            """, f"%{query}%", limit)
+
+            phases = await conn.fetch("""
+                SELECT DISTINCT p.session_id, p.phase_name, p.output_content,
+                       p.created_at, s.task_description
+                FROM agent_phases p
+                JOIN agent_sessions s ON p.session_id = s.session_id
+                WHERE p.output_content ILIKE $1 OR p.input_context ILIKE $1
+                ORDER BY p.created_at DESC
+                LIMIT $2
+            """, f"%{query}%", limit)
+
+            results = {
+                "query": query,
+                "sessions_found": len(sessions),
+                "phases_found": len(phases),
+                "sessions": [dict(s) for s in sessions],
+                "matching_phases": [dict(p) for p in phases]
+            }
+
+            return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@app.get("/context/similar")
+async def find_similar_sessions(
+    task: str,
+    limit: int = 5,
+    api_key: str = Security(verify_api_key)
+):
+    """Find sessions similar to the given task description"""
+    try:
+        keywords = [w.lower() for w in task.split() if len(w) > 3]
+
+        if not keywords:
+            return {"similar_sessions": []}
+
+        async with db.pool.acquire() as conn:
+            similar = await conn.fetch("""
+                SELECT s.session_id, s.task_description, s.status,
+                       s.created_at, s.completed_at,
+                       (
+                           SELECT COUNT(*) FROM agent_phases p
+                           WHERE p.session_id = s.session_id AND p.success = true
+                       ) as successful_phases
+                FROM agent_sessions s
+                WHERE """ + " OR ".join([f"s.task_description ILIKE ${i+1}" for i in range(len(keywords[:5]))]) + """
+                ORDER BY s.created_at DESC
+                LIMIT $""" + str(len(keywords[:5]) + 1),
+                *[f"%{kw}%" for kw in keywords[:5]], limit
+            )
+
+            results = []
+            for session in similar:
+                session_dict = dict(session)
+
+                phases = await conn.fetch("""
+                    SELECT phase_name, model_used, success,
+                           LEFT(output_content, 500) as output_preview
+                    FROM agent_phases
+                    WHERE session_id = $1
+                    ORDER BY created_at
+                """, session['session_id'])
+
+                session_dict['phases'] = [dict(p) for p in phases]
+                results.append(session_dict)
+
+            return {
+                "task": task,
+                "keywords_used": keywords[:5],
+                "similar_sessions": results
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Similar search failed: {str(e)}")
+
+
+@app.get("/context/recent")
+async def get_recent_sessions(
+    limit: int = 10,
+    status: Optional[str] = None,
+    api_key: str = Security(verify_api_key)
+):
+    """Get recent sessions, optionally filtered by status"""
+    try:
+        async with db.pool.acquire() as conn:
+            if status:
+                sessions = await conn.fetch("""
+                    SELECT s.session_id, s.task_description, s.status,
+                           s.created_at, s.completed_at,
+                           (SELECT COUNT(*) FROM agent_phases p
+                            WHERE p.session_id = s.session_id) as total_phases,
+                           (SELECT COUNT(*) FROM agent_phases p
+                            WHERE p.session_id = s.session_id AND p.success = true) as successful_phases
+                    FROM agent_sessions s
+                    WHERE s.status = $1
+                    ORDER BY s.created_at DESC
+                    LIMIT $2
+                """, status, limit)
+            else:
+                sessions = await conn.fetch("""
+                    SELECT s.session_id, s.task_description, s.status,
+                           s.created_at, s.completed_at,
+                           (SELECT COUNT(*) FROM agent_phases p
+                            WHERE p.session_id = s.session_id) as total_phases,
+                           (SELECT COUNT(*) FROM agent_phases p
+                            WHERE p.session_id = s.session_id AND p.success = true) as successful_phases
+                    FROM agent_sessions s
+                    ORDER BY s.created_at DESC
+                    LIMIT $1
+                """, limit)
+
+            return {
+                "status_filter": status,
+                "count": len(sessions),
+                "sessions": [dict(s) for s in sessions]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Recent sessions retrieval failed: {str(e)}")
+
+
+@app.post("/context/log-phase")
+async def log_phase(
+    session_id: str,
+    phase_name: str,
+    model: str,
+    input_context: str,
+    output: str,
+    tokens_used: int,
+    duration_ms: int,
+    success: bool,
+    error_message: Optional[str] = None,
+    api_key: str = Security(verify_api_key)
+):
+    """Log a phase execution"""
+    try:
+        await db.log_phase(
+            session_id, phase_name, model, input_context,
+            output, tokens_used, duration_ms, success, error_message
+        )
+        return {"status": "logged", "session_id": session_id, "phase": phase_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Logging failed: {str(e)}")
+
+
+@app.post("/context/create-session")
+async def create_session(
+    task_description: str,
+    metadata: Optional[dict] = None,
+    api_key: str = Security(verify_api_key)
+):
+    """Create a new agent session"""
+    try:
+        session_id = await db.create_session(task_description, metadata)
+        return {"status": "created", "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session creation failed: {str(e)}")
+
+
+# Startup and shutdown
+@app.on_event("startup")
+async def startup():
+    """Initialize database connection pool on startup"""
+    # print('⚠ DB init skipped for Reactor IDE')  # TEMP DISABLED
+    print("=" * 60)
+    print("✓ MCP Server started successfully")
+    print(f"✓ Database: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+    print(f"✓ Repos: {REPOS_BASE_PATH}")
+    print(f"✓ Allowed repos: {ALLOWED_REPOS}")
+    print(f"✓ GitHub org: {GITHUB_ORG or 'personal account'}")
+    print(f"✓ Multi-user auth: Enabled (Keycloak JWT + API Key)")
+    print("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close database connections on shutdown"""
+    if db.pool:
+        await db.pool.close()
+    print("✓ MCP Server shut down gracefully")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", 8082))
+    print(f"Starting MCP Server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+# Minimal projects endpoint
+@app.get('/api/projects')
+async def get_projects(user: User = Depends(verify_auth)):
+    return {'projects': []}
+
+
+# === Projects Endpoint (validated) ===
+@app.get('/api/projects')
+async def get_projects(user: User = Depends(verify_auth)):
+    return {'projects': []}
+
+@app.api_route("/api/mcp/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_mcp(path: str, request: Request):
+    mcp_base = "https://mcp.wopr.systems"
+    url = f"{mcp_base}/api/{path}"
+
+    headers = dict(request.headers)
+    headers.pop("host", None)
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.request(
+            request.method,
+            url,
+            headers=headers,
+            content=await request.body()
+        )
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp.headers
+    )

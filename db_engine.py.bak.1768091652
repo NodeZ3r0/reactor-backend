@@ -1,0 +1,52 @@
+
+import asyncpg
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "10.0.1.1"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "database": os.getenv("DB_NAME", "agent_memory"),
+    "user": os.getenv("DB_USER", "agent_user"),
+    "password": os.getenv("DB_PASSWORD"),
+}
+
+class DBManager:
+    def __init__(self):
+        self.pool = None
+
+    async def init_pool(self):
+        self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=5, max_size=20)
+
+    async def execute_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.execute(query, *args)
+
+    async def fetch_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetch(query, *args)
+
+    async def fetchval_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetchval(query, *args)
+
+    async def create_session(self, task_description, metadata=None):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO agent_sessions (task_description, metadata) VALUES ($1,$2) RETURNING id",
+                task_description,
+                metadata,
+            )

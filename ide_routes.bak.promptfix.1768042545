@@ -1,0 +1,72 @@
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import difflib
+
+from auth_middleware import verify_api_key
+from server_additions import generate_with_fallback
+
+router = APIRouter(prefix="/api/ide")
+
+
+class IDEFile(BaseModel):
+    path: str
+    content: str
+
+
+class IDEAskRequest(BaseModel):
+    files: List[IDEFile] | None = None
+    question: str | None = None
+    prompt: str | None = None
+    preferred_model: Optional[str] = None
+
+
+class IDEPatch(BaseModel):
+    file: str
+    diff: str
+
+
+class IDEAskResponse(BaseModel):
+    explanation: str
+    patches: List[IDEPatch]
+
+
+@router.get("/health")
+async def ide_health():
+    return {"status": "ok", "service": "reactor-ide"}
+
+
+@router.post("/ask", response_model=IDEAskResponse)
+async def ide_ask(req: IDEAskRequest, _=Depends(verify_api_key)):
+    combined = ""
+    for f in (req.files or []):
+        combined += f"\n--- {f.path} ---\n{f.content}\n"
+
+    prompt = f"""
+You are Reactor IDE Agent.
+You are given the following project files:
+{combined}
+
+User request:
+{req.question}
+
+Return only the modified code blocks.
+"""
+
+    content, model_used = await generate_with_fallback(prompt, req.preferred_model)
+
+    patches = []
+
+    for f in (req.files or []):
+        if f.path in content:
+            old = f.content.splitlines()
+            new = content.split(f.path)[-1].splitlines()
+            diff = "\n".join(
+                difflib.unified_diff(old, new, fromfile=f.path, tofile=f.path)
+            )
+            patches.append(IDEPatch(file=f.path, diff=diff))
+
+    return IDEAskResponse(
+        explanation=f"Generated using {model_used}",
+        patches=patches
+    )

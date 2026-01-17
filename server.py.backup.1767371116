@@ -1,0 +1,101 @@
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
+from typing import List, Dict
+import uuid
+import os
+import json
+import time
+from pathlib import Path
+
+app = FastAPI(title="MCP Backend API")
+
+# =========================
+# AUTH
+# =========================
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+def require_key(key: str = Depends(API_KEY_HEADER)):
+    if key != "test-key-123":
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# =========================
+# DATA MODELS
+# =========================
+
+class PipelineRequest(BaseModel):
+    task: str
+    session_id: str
+    rag_ids: List[str] = []
+
+class PipelineResponse(BaseModel):
+    run_id: str
+    status: str
+    output: Dict
+
+# =========================
+# HEALTH
+# =========================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/api/health")
+def api_health():
+    return {"status": "ok"}
+
+# =========================
+# MODELS
+# =========================
+
+@app.get("/api/models")
+def models():
+    return {
+        "models": [
+            {"id": "agent", "type": "pipeline", "status": "active"}
+        ]
+    }
+
+# =========================
+# RAG UPLOAD
+# =========================
+
+RAG_DIR = "/opt/mcp-agent/rag"
+os.makedirs(RAG_DIR, exist_ok=True)
+
+@app.post("/api/rag/upload", dependencies=[Depends(require_key)])
+async def upload_rag(files: List[UploadFile] = File(...)):
+    rag_ids = []
+    for f in files:
+        rid = str(uuid.uuid4())
+        path = os.path.join(RAG_DIR, f"{rid}_{f.filename}")
+        with open(path, "wb") as out:
+            out.write(await f.read())
+        rag_ids.append(rid)
+    return {"rag_ids": rag_ids}
+
+# =========================
+# PIPELINE
+# =========================
+
+@app.post("/api/pipeline/run", response_model=PipelineResponse, dependencies=[Depends(require_key)])
+def run_pipeline(req: PipelineRequest):
+    run_id = str(uuid.uuid4())
+
+    for rid in req.rag_ids:
+        if not any(rid in name for name in os.listdir(RAG_DIR)):
+            raise HTTPException(status_code=400, detail=f"Missing RAG ID: {rid}")
+
+    return {
+        "run_id": run_id,
+        "status": "completed",
+        "output": {
+            "task": req.task,
+            "rag_used": req.rag_ids,
+            "message": "Pipeline executed successfully"
+        }
+    }
+
+print("✓ MCP Backend loaded cleanly")

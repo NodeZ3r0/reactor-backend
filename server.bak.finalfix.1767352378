@@ -1,0 +1,41 @@
+from fastapi import APIRouter
+
+_ui_router = APIRouter(prefix="/api")
+
+@_ui_router.get("/models/status")
+async def models_status():
+    return {
+        "status": "ok",
+        "models": []
+    }
+
+@_ui_router.get("/tasks")
+async def tasks_list():
+    return {
+        "tasks": []
+    }
+
+app.include_router(_ui_router)
+
+# ============================
+# REACTOR UI COMPATIBILITY
+# ============================
+
+from fastapi import APIRouter
+
+_ui_router = APIRouter(prefix="/api")
+
+@_ui_router.get("/models/status")
+async def models_status():
+    return {
+        "status": "ok",
+        "models": []
+    }
+
+@_ui_router.get("/tasks")
+async def tasks():
+    return {
+        "tasks": []
+    }
+
+app.include_router(_ui_router)

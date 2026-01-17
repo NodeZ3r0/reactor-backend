@@ -1,0 +1,159 @@
+import os
+from pydantic import BaseModel
+# =============================================================================
+# AI GENERATION ADDITIONS - Add these to server.py
+# =============================================================================
+
+# ADD TO IMPORTS (at the very top of server.py):
+import httpx
+from typing import Optional
+import uuid
+
+# ADD AFTER YOUR EXISTING PYDANTIC MODELS:
+
+class GenerateRequest(BaseModel):
+    project_id: str
+    prompt: str
+    model: Optional[str] = "hermes3:70b"
+    file_path: Optional[str] = None
+
+class GenerateResponse(BaseModel):
+    status: str
+    content: str
+    model_used: str
+    file_path: Optional[str] = None
+
+# ADD AFTER YOUR EXISTING CONSTANTS:
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.0.0.3:11434")
+
+MODEL_FALLBACK_CHAIN = [
+    "hermes3:70b",
+    "qwen2.5-coder:32b",
+    "qwen2.5-coder:14b",
+    "qwen2.5-coder:7b",
+]
+
+# ADD THESE HELPER FUNCTIONS BEFORE YOUR ENDPOINTS:
+
+async def call_ollama(prompt: str, model: str, max_tokens: int = 4096) -> Optional[str]:
+    """Call Ollama API via Nebula mesh to Rig"""
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": 0.7,
+                    }
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("response", "")
+            else:
+                print(f"Ollama error ({model}): {response.status_code}")
+                return None
+    except Exception as e:
+        print(f"Ollama exception ({model}): {e}")
+        return None
+
+
+async def generate_with_fallback(prompt: str, preferred_model: str = None) -> tuple[str, str]:
+    """Try to generate code with fallback chain"""
+    models = [preferred_model] + MODEL_FALLBACK_CHAIN if preferred_model else MODEL_FALLBACK_CHAIN
+    models = list(dict.fromkeys([m for m in models if m]))  # Remove None/duplicates
+    
+    for model in models:
+        print(f"Trying model: {model}")
+        content = await call_ollama(prompt, model, max_tokens=8192)
+        if content and len(content) > 50:
+            return content, model
+    
+    raise HTTPException(
+        status_code=503,
+        detail="All AI models failed to generate code. Check Ollama on Rig."
+    )
+
+# ADD THESE ENDPOINTS BEFORE @app.on_event("startup"):
+
+@app.post("/api/generate", response_model=GenerateResponse)
+async def generate_code(
+    req: GenerateRequest,
+    _user=Depends(verify_api_key),
+):
+    """Generate code using AI models on Rig via Nebula"""
+    
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT repo_path, name FROM agent_projects WHERE project_id = $1",
+            uuid.UUID(req.project_id)
+        )
+    finally:
+        await db.pool.release(conn)
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    repo_path = row["repo_path"]
+    project_name = row["name"]
+    
+    enhanced_prompt = f"""Project: {project_name}
+Repository: {repo_path}
+
+Task: {req.prompt}
+
+Instructions:
+- Generate production-quality code
+- Include proper error handling
+- Add comments for complex logic
+- Follow best practices
+- Do not include explanatory text, only code
+
+Code:
+"""
+    
+    content, model_used = await generate_with_fallback(enhanced_prompt, req.model)
+    
+    saved_file_path = None
+    if req.file_path:
+        full_path = os.path.join(repo_path, req.file_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        
+        with open(full_path, "w") as f:
+            f.write(content)
+        
+        saved_file_path = req.file_path
+        print(f"✓ Saved generated code to: {full_path}")
+    
+    return GenerateResponse(
+        status="success",
+        content=content,
+        model_used=model_used,
+        file_path=saved_file_path
+    )
+
+
+@app.get("/api/models", response_model=dict)
+async def list_models(_user=Depends(verify_api_key)):
+    """List available Ollama models on Rig"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            if response.status_code == 200:
+                data = response.json()
+                models = [m["name"] for m in data.get("models", [])]
+                return {
+                    "status": "ok",
+                    "models": models,
+                    "ollama_url": OLLAMA_BASE_URL
+                }
+            else:
+                return {"status": "error", "detail": "Ollama not responding on Rig"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}

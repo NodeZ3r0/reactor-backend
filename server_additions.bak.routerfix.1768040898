@@ -1,0 +1,58 @@
+import os
+import httpx
+from pydantic import BaseModel
+from typing import Optional
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.0.0.3:11434")
+
+MODEL_FALLBACK_CHAIN = [
+    "hermes3:70b",
+    "qwen2.5-coder:32b",
+    "qwen2.5-coder:14b",
+    "qwen2.5-coder:7b",
+]
+
+class GenerateRequest(BaseModel):
+    project_id: str
+    prompt: str
+    model: Optional[str] = None
+    file_path: Optional[str] = None
+
+class GenerateResponse(BaseModel):
+    status: str
+    content: str
+    model_used: str
+    file_path: Optional[str] = None
+
+async def call_ollama(prompt: str, model: str, max_tokens: int = 4096) -> Optional[str]:
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": 0.7,
+                    }
+                }
+            )
+            if resp.status_code == 200:
+                return resp.json().get("response", "")
+    except Exception as e:
+        print("Ollama error:", e)
+    return None
+
+async def generate_with_fallback(prompt: str, preferred_model: str = None):
+    models = [preferred_model] + MODEL_FALLBACK_CHAIN if preferred_model else MODEL_FALLBACK_CHAIN
+    models = [m for i,m in enumerate(models) if m and m not in models[:i]]
+
+    for model in models:
+        print(f"Trying model: {model}")
+        out = await call_ollama(prompt, model, max_tokens=8192)
+        if out and len(out) > 50:
+            return out, model
+
+    raise RuntimeError("All Ollama models failed")

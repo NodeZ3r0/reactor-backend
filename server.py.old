@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import os
+import asyncpg
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from db_context import DatabaseContext as Database
+
+# ==============================================================
+# Basic config
+# ==============================================================
+
+# Repo base path (local filesystem)
+REPOS_BASE_PATH = os.getenv("REPOS_BASE_PATH") or "/home/nodez3r0/ai-coding-agent/repos"
+os.makedirs(REPOS_BASE_PATH, exist_ok=True)
+
+# Simple API key auth (single-user)
+MCP_API_KEY = os.getenv("MCP_API_KEY")
+if not MCP_API_KEY:
+    raise RuntimeError("MCP_API_KEY is not set in /home/nodez3r0/ai-coding-agent/.env")
+
+# Version string (your 2.12.2025 style)
+CODING_AGENT_VERSION = "2.12.2025-1"
+
+# Database wrapper
+db = Database()
+
+app = FastAPI(
+    title="NodeZ3r0 Coding Agent MCP Server",
+    version=CODING_AGENT_VERSION,
+)
+
+# CORS (open; localhost-ish only anyway)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==============================================================
+# Global error handler (so you see JSON, not raw trace)
+# ==============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {str(exc)}"},
+    )
+
+
+# ==============================================================
+# API key auth dependency
+# ==============================================================
+
+async def verify_api_key(request: Request):
+    header_key = request.headers.get("X-API-Key")
+    if not header_key or header_key != MCP_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    # single-user; just return a dummy user dict if we want it later
+    return {"username": "nodez3r0"}
+
+
+# ==============================================================
+# Pydantic models
+# ==============================================================
+
+class ProjectRequest(BaseModel):
+    name: str
+    repo_name: str
+
+
+class Project(BaseModel):
+    project_id: str
+    name: str
+    repo_name: str
+    created_at: Optional[str] = None
+
+
+class ProjectsResponse(BaseModel):
+    projects: List[Project]
+
+
+class CreateProjectResponse(BaseModel):
+    status: str
+    project_id: str
+
+
+# ==============================================================
+# Helper to run queries using db.pool
+# ==============================================================
+
+async def get_conn():
+    if not db.pool:
+        raise RuntimeError("Database pool not initialized")
+    return await db.pool.acquire()
+
+
+# ==============================================================
+# Health & version endpoints
+# ==============================================================
+
+@app.get("/api/health", response_model=dict)
+async def health():
+    return {"status": "ok", "version": CODING_AGENT_VERSION}
+
+
+@app.get("/api/version", response_model=dict)
+async def version():
+    return {"version": CODING_AGENT_VERSION}
+
+
+# ==============================================================
+# Create Project
+# ==============================================================
+
+@app.post("/api/projects", response_model=CreateProjectResponse)
+async def create_project(
+    req: ProjectRequest,
+    _user=Depends(verify_api_key),
+):
+    # Very basic validation for repo_name
+    if not req.repo_name or not all(c.isalnum() or c in "-_" for c in req.repo_name):
+        raise HTTPException(status_code=400, detail="Invalid repo_name (use letters, numbers, - or _)")
+
+    # Repo path on disk
+    repo_path = os.path.join(REPOS_BASE_PATH, req.repo_name)
+    os.makedirs(repo_path, exist_ok=True)
+
+    sql = """
+        INSERT INTO agent_projects (name, slug, repo_name, repo_path, created_by)
+        VALUES ($1, lower(replace($1, ' ', '-')), $2, $3, $4)
+        RETURNING project_id
+    """
+
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            sql,
+            req.name,
+            req.repo_name,
+            repo_path,
+            "nodez3r0",
+        )
+    finally:
+        await db.pool.release(conn)
+
+    project_id = str(row["project_id"])
+    return CreateProjectResponse(status="success", project_id=project_id)
+
+
+# ==============================================================
+# List Projects
+# ==============================================================
+
+@app.get("/api/projects", response_model=ProjectsResponse)
+async def list_projects(_user=Depends(verify_api_key)):
+    sql = """
+        SELECT project_id, name, repo_name, created_at
+        FROM agent_projects
+        ORDER BY created_at DESC
+    """
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(sql)
+    finally:
+        await db.pool.release(conn)
+
+    projects: List[Project] = []
+    for r in rows:
+        projects.append(
+            Project(
+                project_id=str(r["project_id"]),
+                name=r["name"],
+                repo_name=r["repo_name"],
+                created_at=r["created_at"].isoformat() if r["created_at"] else None,
+            )
+        )
+    return ProjectsResponse(projects=projects)
+
+
+# ==============================================================
+# Startup & shutdown
+# ==============================================================
+
+@app.on_event("startup")
+async def startup():
+    await db.init_pool()
+    print("✓ MCP Server started cleanly (single-user API key mode)")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if db.pool:
+        await db.pool.close()
+    print("✓ MCP Server shut down gracefully")
+
+
+# ==============================================================
+# Local dev runner (systemd also uses this)
+# ==============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("MCP_PORT", "8890"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

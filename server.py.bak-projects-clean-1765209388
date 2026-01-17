@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""MCP Server - Clean Build for ai-coding-agent"""
+
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+import asyncpg, os, json
+from dotenv import load_dotenv
+from auth_middleware import extract_user_from_token, User
+
+load_dotenv()
+
+app = FastAPI(
+    title="MCP Agent Server",
+    version="2.0.0",
+    description="Model Context Protocol Server - Clean Replacement"
+)
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+VALID_API_KEY = os.getenv("MCP_API_KEY")
+security = HTTPBearer(auto_error=False)
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "database": os.getenv("DB_NAME", "agent_memory"),
+    "user": os.getenv("DB_USER", "agent_user"),
+    "password": os.getenv("DB_PASSWORD")
+}
+
+REPOS_BASE_PATH = os.getenv("REPOS_BASE_PATH", "/home/nodez3r0/projects")
+os.makedirs(REPOS_BASE_PATH, exist_ok=True)
+
+
+class DBManager:
+    def __init__(self):
+        self.pool = None
+
+    async def init_pool(self):
+        self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=5, max_size=20)
+
+    async def fetchval_with_user_context(self, user, query, *args):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_user_id = '{user.id}'")
+                role = 'admin' if user.is_admin else 'user'
+                await conn.execute(f"SET LOCAL app.user_role = '{role}'")
+                return await conn.fetchval(query, *args)
+
+
+db = DBManager()
+
+
+async def verify_auth(
+    api_key: Optional[str] = Security(API_KEY_HEADER),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> User:
+    if api_key == VALID_API_KEY:
+        return User("system", "system", "system@wopr.systems", is_admin=True)
+    if credentials:
+        user = extract_user_from_token(credentials.credentials)
+        if user:
+            return user
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "database": "connected" if db.pool else "disconnected"
+    }
+
+
+# === Project model ===
+class ProjectRequest(BaseModel):
+    name: str
+    repo_name: str
+
+
+# === Create Project Endpoint ===
+@app.post("/api/projects")
+async def create_project(req: ProjectRequest, user: User = Depends(verify_auth)):
+    try:
+        repo_path = f"{REPOS_BASE_PATH}/{req.repo_name}"
+        record_id = await db.fetchval_with_user_context(
+            user,
+            """
+            INSERT INTO agent_projects (name, slug, repo_name, repo_path, created_by)
+            VALUES ($1, lower(replace($1, ' ', '-')), $2, $3, $4)
+            RETURNING project_id
+            """,
+            req.name,
+            req.repo_name,
+            repo_path,
+            user.username
+        )
+        return {"status": "success", "project_id": str(record_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Project create failed: {str(e)}")
+
+
+@app.on_event("startup")
+async def startup():
+    await db.init_pool()
+    print("✓ MCP Server started cleanly")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if db.pool:
+        await db.pool.close()
+    print("✓ MCP Server shut down gracefully")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("MCP_PORT", 8890)))
