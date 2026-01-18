@@ -30,8 +30,10 @@ app = FastAPI(
 from ui_status_routes import router as ui_status_router
 from ide_routes import router as ide_router
 from server_additions import router as additions_router
+from ollama_routes import router as ollama_router
 app.include_router(ui_status_router)
 app.include_router(ide_router)
+app.include_router(ollama_router)
 
 # Configuration
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
