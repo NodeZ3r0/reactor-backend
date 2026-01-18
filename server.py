@@ -142,11 +142,47 @@ async def verify_auth(
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    ollama_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            ollama_status = "online" if resp.status_code == 200 else "offline"
+    except:
+        ollama_status = "offline"
+    
+    # Check RAG service
+    rag_status = "unknown"
+    doc_count = 0
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{RAG_BASE_URL}/health")
+            if resp.status_code == 200:
+                rag_status = "online"
+                # Try to get document count from RAG service
+                query_resp = await client.post(f"{RAG_BASE_URL}/query", json={"query": "test", "limit": 1000})
+                if query_resp.status_code == 200:
+                    results = query_resp.json().get("results", [])
+                    doc_count = len(results)
+    except:
+        rag_status = "offline"
+    
+    # Check Forgejo
+    forgejo_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://vault.wopr.systems/api/v1/version")
+            forgejo_status = "online" if resp.status_code == 200 else "offline"
+    except:
+        forgejo_status = "offline"
+    
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "database": "connected" if db.pool else "disconnected",
-        "postgres_host": DB_CONFIG["host"]
+        "database": {"status": rag_status, "documents": doc_count},
+        "postgres_host": DB_CONFIG["host"],
+        "ollama": ollama_status,
+        "forgejo": forgejo_status,
+        "mcp": "online"
     }
 
 
