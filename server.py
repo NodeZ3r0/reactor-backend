@@ -58,6 +58,8 @@ DB_CONFIG = {
 REPOS_BASE_PATH = os.getenv("REPOS_BASE_PATH", "/opt")
 ALLOWED_REPOS = [r.strip() for r in os.getenv("ALLOWED_REPOS", "").split(",") if r.strip()]
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.0.0.3:11434")
+RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://10.0.0.3:8087")
 os.makedirs(REPOS_BASE_PATH, exist_ok=True)
 
 
